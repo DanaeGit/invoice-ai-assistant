@@ -183,9 +183,10 @@ aws dynamodb create-table --table-name Invoices \
 # Create the bucket
 aws s3 mb s3://invoices-bucket --endpoint-url http://localhost:4566 --region us-east-1 --profile localstack
 
-# Insert a test item (via a JSON file — avoids shell-escaping pain)
-aws dynamodb put-item --table-name Invoices --item file://seed-invoice.json \
-  --endpoint-url http://localhost:4566 --region us-east-1 --profile localstack
+# Insert sample data (Python/boto3 script — see below; superseded the original
+# `aws dynamodb put-item --item file://seed-invoice.json` one-off used in this session
+# to learn DynamoDB's low-level typed item format)
+python -m scripts.seed_data
 
 # Inspect
 aws dynamodb scan --table-name Invoices --endpoint-url http://localhost:4566 --region us-east-1 --profile localstack
@@ -193,8 +194,8 @@ aws s3 ls --endpoint-url http://localhost:4566 --region us-east-1 --profile loca
 ```
 
 > Note: LocalStack's data doesn't persist across container restarts/removal by default. Everything
-> above needs re-running after `docker rm localstack` + a fresh `docker run`. A future session
-> should turn this block into a small setup script instead of retyping it by hand each time.
+> above needs re-running after `docker rm localstack` + a fresh `docker run`, including
+> `python -m scripts.seed_data` to repopulate sample data.
 
 ### Open items / not yet done
 
@@ -214,13 +215,174 @@ against LocalStack first.
 
 ---
 
+## Session 2 — 2026-08-17: Agent tools, real Bedrock access, FastAPI + Streamlit wired end-to-end
+
+### Goal for the day
+
+Finish milestone 3 (DynamoDB query functions as Strands tools), get real AWS Bedrock access
+working (separate from the LocalStack setup), wire a `POST /ask` FastAPI endpoint on top of the
+Agent, and stand up a minimal Streamlit frontend calling it — i.e. prove the whole front-to-back
+loop end-to-end, even if the very last hop (an actual model reply) ends up blocked on account
+approval rather than code.
+
+### Key concepts learned
+
+**Python, deeper dive**
+- `dict` ≈ Java `Map<K,V>`; Python is dynamically typed, so no generic type declarations.
+- `dict | None` (Python 3.10+ union syntax; `Optional[dict]` pre-3.10) ≈ Java's `@Nullable
+  Map<K,V>` / `Optional<Map<K,V>>` — but critically, **Python's own interpreter does not enforce
+  type hints at runtime**. They're documentation/tooling metadata (read by IDEs, `mypy`, etc.),
+  not a compiler guarantee like Java's type system.
+- Exception to the above: **Strands' `@tool` decorator actually reads type hints and docstrings
+  at runtime** to build the tool's parameter schema for the LLM — so in this specific context,
+  hints and docstrings are functionally load-bearing, not just decorative.
+- PEP 8 is Python's de facto style guide (≈ a shared Checkstyle config) — 2 blank lines between
+  top-level defs, 1 between methods; not enforced by the interpreter, but universally followed and
+  usually auto-applied by formatters like `black`/`ruff`.
+- Google-style docstrings (`Args:` section, one line per parameter) are a community convention,
+  not special syntax — but `docstring_parser` (a Strands dependency) parses this exact structure
+  to extract per-parameter descriptions for the tool schema.
+- `boto3.Session` (capital S, a class) vs `boto3.session` (lowercase, the module containing that
+  class) — easy one-character typo, produces `TypeError: 'module' object is not callable`.
+
+**Running package code correctly (the recurring bug of the day)**
+- `python app/tools.py` (running a file directly) sets `sys.path[0]` to the file's *own*
+  directory (`app/`), so `app` itself isn't importable as a package from inside a file that does
+  `from app.db import ...` → `ModuleNotFoundError: No module named 'app'`.
+- Fix: run as a module from the project root instead — `python -m app.tools`, `python -m
+  app.agent`. This puts the project root on `sys.path[0]` and lets `app.*` resolve correctly.
+  `db.py` never hit this because it has no internal `app.*` import; `uvicorn app.main:app` never
+  hits it either, because uvicorn already imports `app.main` as a module the same way.
+
+**AWS / IAM**
+- IAM (Identity and Access Management) ≈ the permission system behind every AWS account: **users**
+  (an identity, roughly like a Linux user account) get **policies** (JSON documents describing
+  allowed/denied actions) attached to them. Never use root account credentials for
+  programmatic/CLI access — create a scoped IAM user instead, so a leaked key's blast radius is
+  limited to what that policy allows.
+- Kept a second named CLI profile (`bedrock`, real AWS) separate from the earlier `localstack`
+  profile (fake creds, local only) — `boto3.Session(profile_name=...)` picks between them
+  explicitly in code, so the two never collide.
+
+**Bedrock inference types** — this was the main practical rabbit hole today:
+- **On-Demand**: call the base `modelId` directly, pay per token. Many models support this; some
+  newer ones don't.
+- **Cross-Region inference (inference profiles)**: some models — Claude Haiku 4.5 among them —
+  *only* support this. You call an inference-profile ID instead of the base model ID (e.g.
+  `us.anthropic.claude-haiku-4-5-20251001-v1:0` or `global.anthropic.claude-haiku-4-5-20251001-v1:0`),
+  found via `aws bedrock list-inference-profiles`. AWS routes the request across a region or the
+  globe under that ID. Model access is granted once, at the base-model level — it's not a
+  separate grant per inference-profile variant; whichever profile ID you call, it's still checking
+  access against the same underlying model.
+- **Provisioned Throughput**: paid reserved capacity, billed hourly regardless of usage — not
+  relevant for a low-volume learning project.
+- Confirmed via a real `aws bedrock-runtime invoke-model` call that error *type* tells you which
+  layer failed: `AccessDeniedException` → permissions; `ValidationException` (ours: "on-demand
+  throughput isn't supported... use an inference profile") → wrong call shape; `ThrottlingException`
+  ("Too many tokens per day") → request was authenticated and routed correctly, just rate-limited.
+  New Bedrock accounts get conservative default daily-token quotas; raising them means a Service
+  Quotas increase request, which can take AWS support some time to approve (still pending at
+  session end).
+
+**Operational gotcha: orphaned `uvicorn --reload` workers**
+- After a bad edit crashed uvicorn's auto-reload worker, killing the *reloader* process (the PID
+  uvicorn prints at startup) did not kill the already-spawned *worker* child process — the old
+  worker kept running independently, still bound to the port, still serving the stale
+  pre-edit code. Symptom was confusing: `/health` kept responding (from the orphaned old worker),
+  new routes 404'd (also from the same stale worker), and `netstat` briefly showed two PIDs both
+  claiming to `LISTEN` on the same port. Fix: identify every `python.exe` process actually
+  associated with the dev servers (cross-check against `netstat -ano` for the specific ports),
+  kill all of them, then start one truly fresh process. Lesson: when a reload/restart produces
+  behavior that doesn't match the current file on disk, don't trust that the running process
+  reflects the code — verify independently (e.g. `python -c "from app.main import app; print(app.routes)"`)
+  before spending time debugging the code itself.
+
+### What got built today
+
+- `app/tools.py`: `get_invoice_by_id` and `search_invoices_by_vendor`, both decorated `@tool`
+  with Google-style docstrings, wrapping `app/db.py`'s table access.
+- Real AWS Bedrock access: dedicated IAM user (`invoice-ai-bedrock`, `AmazonBedrockFullAccess`
+  policy only — no Service Quotas or other permissions), local `bedrock` CLI profile, Claude
+  Haiku 4.5 model access requested and granted in `us-east-1`.
+- `app/agent.py`: `build_agent()` constructs a `BedrockModel` (via a `boto3.Session` scoped to the
+  `bedrock` profile) and a Strands `Agent` wired to the two tools above. Model ID and profile name
+  both come from `.env` (`BEDROCK_AWS_PROFILE`, `BEDROCK_MODEL_ID`), kept separate from the
+  DynamoDB-focused `AWS_PROFILE`/`DYNAMODB_ENDPOINT_URL` vars so local-dev and real-AWS credentials
+  never collide.
+- `app/main.py`: `POST /ask` endpoint (Pydantic `AskRequest` body) that builds a fresh Agent per
+  request (deliberately stateless — no cross-request conversation memory yet) and returns
+  `str(result)`.
+- `scripts/seed_data.py`: five sample invoices across three vendors and two statuses, via boto3's
+  high-level `resource` API (plain Python dicts, no manual `{"S": ...}` type tags) — supersedes and
+  replaces the one-off `seed-invoice.json` used in Session 1 to teach the low-level item format
+  (that file has been deleted; the CLI command it supported is no longer part of the reproducible
+  setup flow).
+- `frontend/app.py`: minimal Streamlit chat UI (`st.chat_message`/`st.chat_input`), posts to the
+  FastAPI `/ask` endpoint via `requests`, renders the answer or a caught request error.
+- `.streamlit/credentials.toml` created locally (not project-specific — this is a one-time,
+  per-machine Streamlit config) to pre-answer the interactive first-run "email?" onboarding prompt
+  that otherwise blocks non-interactive/background startup.
+
+### Verified end-to-end (up to the external blocker)
+
+`python -m app.agent` successfully built the session, the Bedrock model, the Agent, registered
+both tools, and made a real, correctly authenticated, correctly routed `ConverseStream` call to
+Bedrock — confirmed by getting a `ThrottlingException` (not a permissions or validation error) as
+the final result. Same confirmed through the FastAPI `/ask` route once the endpoint and its
+imports were fixed. **The code path is proven correct end-to-end; the only remaining blocker is
+the pending Bedrock daily-token quota increase**, which is an AWS approval queue, not something to
+debug further on our side.
+
+### Bugs hit and fixed today (for the pattern-recognition value, not the specifics)
+
+- Parameter name typo (`invocice_id`) not matching the docstring's `invoice_id`.
+- `table = get_invoices_table` missing `()` — same "forgot to call it" class of bug as
+  `app = FastAPI` and `load_dotenv` from Session 1, now three-for-three. Worth internalizing:
+  whenever something behaves like "has no such method," check whether it was ever actually
+  *called*, not just referenced.
+- `response.get("Item", [])` after a `scan()` — should be `"Items"` (plural); `get_item` returns
+  singular `"Item"`, `scan`/`query` return plural `"Items"`. Silent bug (no crash, just always
+  empty), the sneakiest kind.
+- Test code calling the wrong function (`get_invoices_table("inv-001")` instead of
+  `get_invoice_by_id("inv-001")`) — easy to do when a low-level helper and a business-level
+  wrapper have similar names.
+- `boto3.session(...)` vs `boto3.Session(...)` capitalization.
+- `from app.agent import BaseModel` instead of `from app.agent import build_agent` — an
+  autocomplete misfire (similar-looking suggestions).
+
+### Open items / not yet done
+
+- **Blocking**: Bedrock daily-token quota increase still pending AWS approval. Nothing else to do
+  here except wait and re-test once approved.
+- `app/_init_.py` still needs renaming to `app/__init__.py` (harmless typo, carried over from
+  Session 1).
+- No conversation memory across `/ask` requests yet (each call builds a stateless Agent).
+- S3 is still empty — no file has been uploaded yet, and nothing reads from it. Deliberately
+  deferred: everything the Agent currently answers comes from already-extracted DynamoDB fields;
+  a tool that reads the raw file from S3 only becomes necessary for questions the structured data
+  can't answer (e.g. "is there a signature/stamp on this invoice," or handing back a link to the
+  original document) — see the roadmap below for when that becomes relevant.
+
+### Next session
+
+Once the Bedrock quota increase is approved: re-run `python -m app.agent` (or hit `/ask` through
+Streamlit) to confirm a real model answer comes back, referencing the seeded sample data (e.g. "how
+much did we spend with Acme Corp total?" should require the Agent to call
+`search_invoices_by_vendor` and reason over multiple line items). Then move to milestone 5: a file
+upload endpoint (PDF/photo → parse via a Strands Agent call → write structured fields to DynamoDB +
+raw file to S3).
+
+---
+
 ## Roadmap (living)
 
 1. ~~Data model definition~~ ✅
 2. ~~Local DynamoDB + S3 environment (LocalStack), seeded test data~~ ✅
-3. Agent tools (DynamoDB query functions wired into Strands) — **next**
-4. `POST /ask` conversational endpoint (Strands Agent + Bedrock)
-5. File upload endpoint: PDF/photo → parse → write to DynamoDB + S3
+3. ~~Agent tools (DynamoDB query functions wired into Strands)~~ ✅
+4. ~~`POST /ask` conversational endpoint (Strands Agent + Bedrock) + minimal Streamlit frontend~~ ✅
+   code-complete; blocked on pending Bedrock quota approval for a real end-to-end answer
+5. File upload endpoint: PDF/photo → parse → write to DynamoDB + S3 — **next**
 6. Reports / BI-style structured aggregation output
 7. Later: swap hand-rolled parsing for Bedrock Data Automation; move parsing to an
    S3-event-triggered Lambda instead of running synchronously in FastAPI
+28
