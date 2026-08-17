@@ -385,4 +385,32 @@ raw file to S3).
 6. Reports / BI-style structured aggregation output
 7. Later: swap hand-rolled parsing for Bedrock Data Automation; move parsing to an
    S3-event-triggered Lambda instead of running synchronously in FastAPI
+8. Later: package this FastAPI app with Mangum for Lambda deployment, to match how the rest of
+   the team's system runs (see Session 3 note below) — only needed once this module has to be
+   reachable by the rest of the team's system, not for local development
+
+---
+
+## Session 3 — 2026-08-18: Team stack context (no code changes)
+
+Learned the wider group project's stack from a teammate, for context — this repo stays
+independent, nothing here changed as a result:
+
+- **Frontend**: React 18.3.1 + TypeScript, React Router 6.26, Vite, Tailwind CSS, Vitest + React
+  Testing Library. This is the *real* production frontend the team is building; the Streamlit app
+  in this repo remains just a local dev/debug tool for exercising `/ask` — no conflict, since both
+  are just HTTP clients against the same JSON API. Nothing here needs to change when the real
+  frontend is React instead of Streamlit.
+- **Backend**: FastAPI 0.115.0, Uvicorn 0.30.0, Pydantic 2.9.0, Boto3 — same core stack as this
+  project, different pinned versions.
+- **Mangum 0.17.0** in their dependency list is the signal worth remembering: Mangum is an adapter
+  that wraps an ASGI app (like FastAPI) so it can run inside **AWS Lambda** instead of a
+  long-running Uvicorn process — Lambda starts on-demand per request rather than staying always-on.
+  This means the team's real backend deployment target is Lambda, not a persistent server.
+
+**Decision**: this repo (and its module) stays a fully independent service — no code merge, no
+need to match the team's exact dependency versions, since integration will happen over an API
+boundary, not a shared codebase. If/when this module needs to be reachable from the team's system,
+wrapping `app/main.py` with Mangum for Lambda deployment (roadmap item 8) is the way to match their
+operational pattern — not required for continued local development.
 28
